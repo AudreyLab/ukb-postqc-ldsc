@@ -1,0 +1,81 @@
+
+#---------- REGENIE OUTPUT ----------
+#
+# Suppose these regenie output files
+# One file per chromosome
+#
+
+ls -1 *.chr*_*.regenie.gz | sort -V
+# gwasA.chr1_PHENO.regenie.gz
+# gwasA.chr2_PHENO.regenie.gz
+# gwasA.chr3_PHENO.regenie.gz
+#  ...
+# gwasA.chr20_PHENO.regenie.gz
+# gwasA.chr21_PHENO.regenie.gz
+# gwasA.chr22_PHENO.regenie.gz
+
+
+
+#---------- PREPARE ENVIRONMENT ----------
+# 
+# Set these variables to match the names above
+#
+ gwas=gwasA
+pheno=PHENO
+
+# !!! test !!!
+ls -1 ${gwas}.chr*_${pheno}.regenie.gz | sort -V
+
+
+
+#---------- GWAS post-filtering ----------
+#
+# We want:
+#  EMAC  >= 100
+#  HWE P >= 1e-12
+#
+
+( \
+zcat ${gwas}.chr1_${pheno}.regenie.gz \
+  | head -1 ; \
+for chr in `seq 1 22`; do
+zcat ${gwas}.chr${chr}_${pheno}.regenie.gz \
+  | tail -n +2
+done \
+ ) \
+  | ${GWAS_TOOLS}/post_filter.exe \
+    100 1e-12 \
+  | pigz -9 -p 22 -c -- \
+   > ${gwas}_${pheno}.regenie.gz
+
+zcat ${gwas}_${pheno}.regenie.gz | wc -l
+zcat ${gwas}_${pheno}.regenie.gz | head -3
+
+
+
+#---------- prepare GWAS for LDSC ----------
+#
+# NOTE: regenie doesn't have an explicit SE column
+#   as it outputs the 95% confidence intervals instead
+#
+# For logistic regression:
+#  BETA and SE are extracted from the INFO string
+#  since the Effect column contains odds ratios
+#
+# For linear regression:
+#  BETA is extracted from the Effect column
+#    SE is extracted from the INFO string
+#
+# Z is defined as BETA / SE
+#
+
+zcat ${gwas}_${pheno}.regenie.gz \
+  | ${GWAS_TOOLS}/prep_munge.exe + \
+  | pigz -9 -p 22 -c -- \
+  > ${gwas}_${pheno}.pre-munged.gz
+
+zcat ${gwas}_${pheno}.pre-munged.gz | wc -l
+zcat ${gwas}_${pheno}.pre-munged.gz | head -3
+
+# ----------
+# continue with LDSC's munge_sumstats.py
