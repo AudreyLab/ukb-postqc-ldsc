@@ -75,6 +75,32 @@ def hwe_pvalue(obs_hom1: int, obs_het: int, obs_hom2: int) -> float:
         k += 2
     return min(1.0, tail)
 
+def infer_genotype_counts(parts: list, col_idx: dict, controls: bool = True) -> Optional[Tuple[int,int,int]]:
+    """
+    Déduit les comptes de génotypes (hom_ref, het, hom_alt) depuis les colonnes du fichier.
+    Si controls=True, utilise les colonnes Controls_*, sinon Cases_*
+    """
+    if controls:
+        ref_col = col_idx.get("Controls_Ref")
+        het_col = col_idx.get("Controls_Het")
+        alt_col = col_idx.get("Controls_Alt")
+    else:
+        ref_col = col_idx.get("Cases_Ref")
+        het_col = col_idx.get("Cases_Het")
+        alt_col = col_idx.get("Cases_Alt")
+    
+    if ref_col is not None and het_col is not None and alt_col is not None:
+        if ref_col < len(parts) and het_col < len(parts) and alt_col < len(parts):
+            try:
+                return (
+                    int(float(parts[ref_col])),
+                    int(float(parts[het_col])),
+                    int(float(parts[alt_col]))
+                )
+            except:
+                pass
+    return None
+
 def infer_counts_from_info(info: Dict[str,str]) -> Optional[Tuple[int,int,int]]:
     """
     Essaie de déduire (hom_ref, het, hom_alt) depuis INFO si présent.
@@ -115,12 +141,12 @@ def main():
     ap.add_argument("--out", dest="out", default="-", help="Output TSV/TSV.GZ or '-' for stdout")
     ap.add_argument("--emac-min", type=float, default=100.0, help="Minimum EMAC (default 100)")
     ap.add_argument("--hwe-minp", type=float, default=1e-12, help="Minimum HWE p-value (default 1e-12)")
-    ap.add_argument("--id-col", default="ID", help="SNP id column (default: ID)")
-    ap.add_argument("--a1-col", default="A1", help="Effect allele col name if needed (optional)")
-    ap.add_argument("--a2-col", default="A2", help="Other allele col name (optional)")
-    ap.add_argument("--aaf-col", default="A1FREQ", help="ALT/effect allele frequency column (default: A1FREQ)")
-    ap.add_argument("--n-col", default="N", help="Effective N column (or total N) (default: N)")
-    ap.add_argument("--info-col", default="INFO", help="INFO key=val;... column (default: INFO)")
+    ap.add_argument("--id-col", default="Name", help="SNP id column (default: Name)")
+    ap.add_argument("--aaf-col", default="AAF", help="ALT/effect allele frequency column (default: AAF)")
+    ap.add_argument("--n-col", default="Num_Cases", help="Sample size column (default: Num_Cases)")
+    ap.add_argument("--info-col", default="Info", help="INFO key=val;... column (default: Info)")
+    ap.add_argument("--use-controls", action="store_true", help="Use Controls genotype counts for HWE instead of Cases")
+    ap.add_argument("--use-mac-from-info", action="store_true", help="Use MAC from INFO field instead of calculating EMAC")
     args = ap.parse_args()
 
     inp = open_any(args.inp)
@@ -128,42 +154,75 @@ def main():
 
     header = inp.readline().rstrip("\n")
     if not header:
+        sys.stderr.write("Erreur: fichier vide ou sans en-tête\n")
         return
+    
     cols = header.split("\t")
     col_idx = {c:i for i,c in enumerate(cols)}
-    print(header, file=out_handle)
-
+    
+    # Vérification des colonnes essentielles
     id_i   = col_idx.get(args.id_col, None)
     aaf_i  = col_idx.get(args.aaf_col, None)
     n_i    = col_idx.get(args.n_col, None)
     info_i = col_idx.get(args.info_col, None)
+    
+    if id_i is None:
+        sys.stderr.write(f"⚠️ Attention: colonne '{args.id_col}' non trouvée\n")
+    if aaf_i is None:
+        sys.stderr.write(f"⚠️ Attention: colonne '{args.aaf_col}' non trouvée\n")
+    if n_i is None:
+        sys.stderr.write(f"⚠️ Attention: colonne '{args.n_col}' non trouvée\n")
+    if info_i is None:
+        sys.stderr.write(f"⚠️ Attention: colonne '{args.info_col}' non trouvée\n")
+    
+    sys.stderr.write(f"Colonnes détectées: {', '.join(cols)}\n")
+    sys.stderr.write(f"Filtres appliqués: EMAC >= {args.emac_min}, HWE p-value >= {args.hwe_minp}\n\n")
+    
+    # Écrire l'en-tête
+    print(header, file=out_handle)
 
     kept = 0
+    total = 0
+    filtered_emac = 0
+    filtered_hwe = 0
+    
     for line in inp:
         line = line.rstrip("\n")
         if not line:
             continue
+        
+        total += 1
         parts = line.split("\t")
-        # parse INFO
+        
+        # Parse INFO
         info = {}
         if info_i is not None and info_i < len(parts):
             info = parse_info(parts[info_i])
 
-        # HWE : soit directement via INFO['HWE'], soit via comptes géno si présents
+        # ========== HWE ==========
         hwe_p = None
         if "HWE" in info:
             hwe_p = parse_float_safe(info["HWE"])
         else:
-            counts = infer_counts_from_info(info)
+            # Essayer depuis les colonnes de génotypes
+            counts = infer_genotype_counts(parts, col_idx, controls=args.use_controls)
+            if counts is None:
+                # Essayer depuis INFO
+                counts = infer_counts_from_info(info)
             if counts:
                 homref, het, homalt = counts
                 hwe_p = hwe_pvalue(homref, het, homalt)
 
-        # EMAC : si INFO['EMAC'] existe, on l’utilise, sinon EMAC ≈ 2*N_eff*MAF
+        # ========== EMAC ==========
         emac = None
-        if "EMAC" in info:
+        if args.use_mac_from_info and "MAC" in info:
+            # Utiliser directement MAC depuis INFO
+            emac = parse_float_safe(info["MAC"])
+        elif "EMAC" in info:
+            # Utiliser EMAC depuis INFO
             emac = parse_float_safe(info["EMAC"])
         else:
+            # Calculer EMAC depuis AAF et N
             aaf = None
             neff = None
             if aaf_i is not None and aaf_i < len(parts):
@@ -172,16 +231,38 @@ def main():
                 neff = parse_float_safe(parts[n_i])
             emac = emac_from_fields(aaf, neff)
 
-        pass_hwe  = (hwe_p is None) or (hwe_p >= args.hwe_minp)   # si inconnu: ne pas filtrer
-        pass_emac = (emac is None) or (emac >= args.emac_min)     # si inconnu: ne pas filtrer
+        # ========== FILTRAGE ==========
+        # ⚠️ CHANGEMENT IMPORTANT: si valeur inconnue, on REJETTE le variant
+        pass_hwe  = (hwe_p is not None) and (hwe_p >= args.hwe_minp)
+        pass_emac = (emac is not None) and (emac >= args.emac_min)
+        
+        # Pour le débogage des premiers variants
+        if total <= 3:
+            sys.stderr.write(f"Variant {total} ({parts[id_i] if id_i and id_i < len(parts) else 'N/A'}):\n")
+            sys.stderr.write(f"  EMAC={emac}, pass={pass_emac}\n")
+            sys.stderr.write(f"  HWE p-value={hwe_p}, pass={pass_hwe}\n")
 
+        if not pass_emac:
+            filtered_emac += 1
+        if not pass_hwe:
+            filtered_hwe += 1
+            
         if pass_hwe and pass_emac:
             print(line, file=out_handle)
             kept += 1
 
     if out_handle is not sys.stdout:
         out_handle.close()
+    
+    # Statistiques finales
+    sys.stderr.write(f"\n{'='*60}\n")
+    sys.stderr.write(f"Statistiques de filtrage:\n")
+    sys.stderr.write(f"  Total variants: {total}\n")
+    sys.stderr.write(f"  Filtrés (EMAC < {args.emac_min}): {filtered_emac}\n")
+    sys.stderr.write(f"  Filtrés (HWE p < {args.hwe_minp}): {filtered_hwe}\n")
+    sys.stderr.write(f"  Variants conservés: {kept}\n")
+    sys.stderr.write(f"  Taux de rétention: {100*kept/total:.2f}%\n")
+    sys.stderr.write(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
-
